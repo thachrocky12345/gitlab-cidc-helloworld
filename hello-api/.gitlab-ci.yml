@@ -1,0 +1,217 @@
+# ============================================================================
+# GitLab CI/CD Pipeline — Hello API
+# Stages run sequentially; jobs within a stage run in parallel.
+# Fail-fast philosophy: cheap/fast checks early, expensive ones later.
+# ============================================================================
+
+stages:
+  - lint           # Static checks - cheapest, runs first
+  - test           # Unit tests + coverage
+  - security       # SAST, secrets, dependency CVEs
+  - build          # Docker image build & push to registry
+  - scan           # Container image vulnerability scan
+  - deploy         # Promote image to staging/prod
+
+# --------------------------------------------------------------------------
+# Global variables - propagated to every job
+# --------------------------------------------------------------------------
+variables:
+  PYTHON_VERSION: "3.12"
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  IMAGE_NAME: "$CI_REGISTRY_IMAGE"
+  IMAGE_TAG: "$CI_COMMIT_SHORT_SHA"
+  # BuildKit dramatically speeds up Docker builds via parallelism + caching
+  DOCKER_BUILDKIT: "1"
+
+# --------------------------------------------------------------------------
+# Cache pip downloads between jobs - cuts install time ~80%
+# --------------------------------------------------------------------------
+.python-cache: &python-cache
+  cache:
+    key:
+      files:
+        - requirements.txt
+        - requirements-dev.txt
+    paths:
+      - .cache/pip
+      - .venv/
+
+# --------------------------------------------------------------------------
+# Anchor for Python setup
+# --------------------------------------------------------------------------
+.python-base:
+  image: python:3.12.7-slim
+  <<: *python-cache
+  before_script:
+    - python -m venv .venv
+    - source .venv/bin/activate
+    - pip install --upgrade pip
+    - pip install -r requirements-dev.txt
+
+# ============================================================================
+# STAGE: lint
+# ============================================================================
+lint:ruff:
+  extends: .python-base
+  stage: lint
+  script:
+    - ruff check app/ tests/
+    - ruff format --check app/ tests/
+
+lint:hadolint:
+  stage: lint
+  image: hadolint/hadolint:latest-alpine
+  script:
+    - hadolint Dockerfile
+
+# ============================================================================
+# STAGE: test
+# ============================================================================
+test:pytest:
+  extends: .python-base
+  stage: test
+  script:
+    - pytest --cov=app --cov-report=xml --cov-report=term --junitxml=report.xml
+    - coverage report --fail-under=80
+  coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
+  artifacts:
+    when: always
+    reports:
+      junit: report.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+    expire_in: 1 week
+
+# ============================================================================
+# STAGE: security
+# ============================================================================
+# Use GitLab's built-in security templates where available — they auto-report
+# to the Vulnerability dashboard and the MR widget.
+include:
+  - template: Jobs/SAST.gitlab-ci.yml
+  - template: Jobs/Secret-Detection.gitlab-ci.yml
+
+security:bandit:
+  extends: .python-base
+  stage: security
+  script:
+    - bandit -r app/ -f json -o bandit-report.json || true
+    - bandit -r app/ --severity-level medium
+  artifacts:
+    paths:
+      - bandit-report.json
+    expire_in: 1 week
+
+security:gitleaks:
+  stage: security
+  image:
+    name: zricethezav/gitleaks:latest
+    entrypoint: [""]
+  script:
+    - gitleaks detect --source . --report-format json --report-path gitleaks-report.json --exit-code 1
+  artifacts:
+    when: always
+    paths:
+      - gitleaks-report.json
+    expire_in: 1 week
+
+# ============================================================================
+# STAGE: build
+# ============================================================================
+build:image:
+  stage: build
+  image: docker:27.3.1
+  services:
+    - docker:27.3.1-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    # Build with BuildKit cache pulling from previous image
+    - |
+      docker build \
+        --cache-from "$IMAGE_NAME:latest" \
+        --build-arg BUILDKIT_INLINE_CACHE=1 \
+        --label "org.opencontainers.image.revision=$CI_COMMIT_SHA" \
+        --label "org.opencontainers.image.source=$CI_PROJECT_URL" \
+        --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        -t "$IMAGE_NAME:$IMAGE_TAG" \
+        -t "$IMAGE_NAME:latest" \
+        .
+    - docker push "$IMAGE_NAME:$IMAGE_TAG"
+    - docker push "$IMAGE_NAME:latest"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# ============================================================================
+# STAGE: scan - scan the JUST-BUILT image
+# ============================================================================
+scan:trivy:
+  stage: scan
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  variables:
+    GIT_STRATEGY: none   # No need to clone repo - we're scanning an image
+  before_script:
+    - export TRIVY_USERNAME=$CI_REGISTRY_USER
+    - export TRIVY_PASSWORD=$CI_REGISTRY_PASSWORD
+  script:
+    # Generate JSON report for GitLab to ingest
+    - trivy image --exit-code 0 --no-progress
+        --format template --template "@/contrib/gitlab.tpl"
+        -o gl-container-scanning-report.json
+        "$IMAGE_NAME:$IMAGE_TAG"
+    # Fail the build on HIGH/CRITICAL CVEs (tunable threshold)
+    - trivy image --exit-code 1 --severity HIGH,CRITICAL --no-progress
+        "$IMAGE_NAME:$IMAGE_TAG"
+  artifacts:
+    when: always
+    reports:
+      container_scanning: gl-container-scanning-report.json
+    expire_in: 1 week
+  needs: ["build:image"]
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# ============================================================================
+# STAGE: deploy
+# ============================================================================
+# Staging deploys automatically on every push to main.
+# Production requires manual approval — a critical safety gate.
+
+deploy:staging:
+  stage: deploy
+  image: alpine:3.20
+  environment:
+    name: staging
+    url: https://staging.hello-api.example.com
+  before_script:
+    - apk add --no-cache openssh-client curl
+  script:
+    # Real deploy: SSH into host, pull new image, restart container
+    # via Ansible playbook, Helm chart, ArgoCD sync, ECS update, etc.
+    - echo "Deploying $IMAGE_NAME:$IMAGE_TAG to staging"
+    # ansible-playbook -i inventory/staging deploy.yml -e "image_tag=$IMAGE_TAG"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+deploy:production:
+  stage: deploy
+  image: alpine:3.20
+  environment:
+    name: production
+    url: https://hello-api.example.com
+  script:
+    - echo "Deploying $IMAGE_NAME:$IMAGE_TAG to production"
+    # ansible-playbook -i inventory/production deploy.yml -e "image_tag=$IMAGE_TAG"
+  rules:
+    # Manual gate - protected branches + manual button click
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: false
+  needs: ["deploy:staging"]

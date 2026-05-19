@@ -1,0 +1,45 @@
+# Keep build context small and prevent secrets/junk from leaking into images
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test / coverage artifacts
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Git
+.git/
+.gitignore
+.gitlab-ci.yml
+
+# Docs / local dev
+README.md
+Makefile
+docker-compose.yml
+*.md
+
+# Secrets - belt and suspenders. NEVER ship these.
+.env
+.env.*
+*.pem
+*.key
+
+# Tests don't belong in the production image
+tests/

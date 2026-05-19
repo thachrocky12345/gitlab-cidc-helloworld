@@ -1,0 +1,22 @@
+# Local development & integration testing
+# Usage: docker compose up --build
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hello-api:local
+    container_name: hello-api
+    ports:
+      - "8000:8000"
+    environment:
+      APP_ENV: local
+      LOG_LEVEL: DEBUG
+      APP_VERSION: ${APP_VERSION:-dev}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/live"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
